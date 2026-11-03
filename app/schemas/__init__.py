@@ -7,5 +7,6 @@ __all__ = [
     "EsquemaDeEntrada",
     "EsquemaDeSaida",
     "UsuarioCreate",
+    "UsuarioLogin",
     "UsuarioOut",
 ]
