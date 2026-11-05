@@ -1,8 +1,7 @@
 """Ponto de entrada: cria o app, registra as rotas e traduz erros em HTTP."""
-from collections.abc import AsyncIterator
+from sqlmodel import Session
 from contextlib import asynccontextmanager
 from typing import Any
-
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -11,20 +10,18 @@ from app.core.config import obter_configuracao
 from app.core.exceptions import (
     EmailJaCadastrado,
     ErroDeDominio,
+    NaoAutenticado,
     RecursoNaoEncontrado,
     RegraDeNegocioViolada,
-    NaoAutenticado,
 )
 from app.db.database import criar_tabelas
 
-# Cada família de erro de domínio corresponde a um código HTTP. A ordem
-# importa: vale o primeiro tipo que casar, do mais específico ao mais geral.
 STATUS_POR_ERRO: tuple[tuple[type[ErroDeDominio], int], ...] = (
     (RecursoNaoEncontrado, 404),
     (EmailJaCadastrado, 409),
+    (NaoAutenticado, 401),
     (RegraDeNegocioViolada, 422),
     (ErroDeDominio, 400),
-    (NaoAutenticado, 401),
 )
 
 
@@ -33,7 +30,7 @@ async def ciclo_de_vida(app: FastAPI) -> AsyncIterator[None]:
     """Confere a configuração e prepara o banco na subida da aplicação.
 
     `segredo_jwt()` é chamado aqui de propósito: sem `JWT_SECRET`, a API se
-    recusa a subir com uma mensagem explicando o que fazer em vez de subir
+    recusa a subir em vez de manter explícito o que fazer - em vez de subir
     e só falhar no primeiro login.
     """
     obter_configuracao().segredo_jwt()
@@ -44,35 +41,40 @@ async def ciclo_de_vida(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="Todo List API",
     description="Back-end do Todo List - curso Desenvolvedor Full Stack (SENAC).",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=ciclo_de_vida,
 )
+
 
 @app.exception_handler(ErroDeDominio)
 async def tratar_erro_de_dominio(
     _request: Request, excecao: ErroDeDominio
 ) -> JSONResponse:
     """Converte qualquer erro de domínio na resposta HTTP correspondente."""
-
     codigo = next(
-        (codigo for tipo, codigo in STATUS_POR_ERRO if isinstance(excecao, tipo)), 400
+        (status for tipo, status in STATUS_POR_ERRO if isinstance(excecao, tipo)), 400
     )
-    return JSONResponse(status_code=codigo, content={"detail": excecao.mensagem})
+    cabecalhos = {"WWW-Authenticate": "Bearer"} if codigo == 401 else None
+    return JSONResponse(
+        status_code=codigo, content={"detail": excecao.mensagem}, headers=cabecalhos
+    )
 
 
-def mensagem_de_validacao(erro: dict[str, Any]) -> tuple[str, str]:
-    """Traduz um erro do Pydantic em (campo, mensagem em português)."""
+def _mensagem_de_validacao(erro: dict[str, Any]) -> tuple[str, str]:
+    """Traduz um erro do Pydantic em campo, mensagem e português."""
+    campo = str(erro["loc"][-1]) if erro.get("loc") else "dados"
+    tipo = erro.get("type", "")
+
+    def _mensagem_de_validacao(erro: dict[str, Any]) -> tuple[str, str]:
+     """Traduz um erro do Pydantic em campo, mensagem em português."""
     campo = str(erro["loc"][-1]) if erro.get("loc") else "dados"
     tipo = erro.get("type", "")
     ctx = erro.get("ctx", {})
     mensagens = {
         "missing": f"O campo '{campo}' é obrigatório.",
-        "string_too_short": f"O campo '{campo}' precisa ter pelo menos "
-        f"{ctx.get('min_length')} caractere(s).",
-        "string_too_long": f"O campo '{campo}' pode ter no máximo "
-        f"{ctx.get('max_length')} caracteres.",
-        "enum": f"Valor inválido para '{campo}'. Valores aceitos: "
-        f"{str(ctx.get('expected', '')).replace(' or ', ' ou ')}.",
+        "string_too_short": f"O campo '{campo}' precisa ter pelo menos {ctx.get('min_length')} caractere(s).",
+        "string_too_long": f"O campo '{campo}' pode ter no máximo {ctx.get('max_length')} caractere(s).",
+        "enum": f"Valor inválido para '{campo}'. Valores aceitos: {str(ctx.get('expected', '')).replace(' or ', ', ')}.",
         "date_parsing": f"Data inválida em '{campo}'. Use o formato AAAA-MM-DD.",
         "date_from_datetime_parsing": f"Data inválida em '{campo}'. Use o formato AAAA-MM-DD.",
         "int_parsing": f"O campo '{campo}' precisa ser um número inteiro.",
@@ -92,19 +94,28 @@ def mensagem_de_validacao(erro: dict[str, Any]) -> tuple[str, str]:
 async def tratar_erro_de_validacao(
     _request: Request, excecao: RequestValidationError
 ) -> JSONResponse:
-    """Responde 422 com `detail` sempre em TEXTO, em português."""
+    """Responde 422 com 'detail' sempre em TEXTO, em português.
 
+    O padrão do FastAPI devolve 'detail' como uma lista de objetos em inglês -
+    difícil de mostrar ao usuário. Aqui 'detail' traz a primeira mensagem
+    pronta para exibir, e 'erros' traz a lista completa, campo a campo.
+    """
     erros = [
         {"campo": campo, "mensagem": mensagem}
-        for campo, mensagem in map(mensagem_de_validacao, excecao.errors())
+        for campo, mensagem in map(_mensagem_de_validacao, excecao.errors())
     ]
     return JSONResponse(
         status_code=422,
-        content={"detail": erros[0]["mensagem"] if erros else "Dados inválidos.", "erros": erros},
+        content={
+            "detail": erros[0]["mensagem"] if erros else "Dados inválidos.",
+            "erros": erros,
+        },
     )
 
 
 app.include_router(usuarios.router)
+
+
 @app.get("/", tags=["Status"], summary="Verificar se a API está no ar")
 def raiz() -> dict[str, str]:
     """Confirma que a API está no ar e indica onde está a documentação."""
